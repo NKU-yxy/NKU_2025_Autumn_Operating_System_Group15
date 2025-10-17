@@ -49,3 +49,29 @@ static inline struct Page* turn_pfn_to_page(size_t pfn)
     // 然后返回&pages[idx] 这样就返回了对应的page指针
     return pa2page((pfn << PGSHIFT)); 
 }
+
+// 定义flist方便后续写，flist(order)即为order阶对应的list的表头
+#define flist(order) (buddy_area.free_lists[(order)])
+
+// 把一个“空闲块头页”p 插入 order阶对应的空闲表，并设置空闲&头页属性(原函数在memlayout.h内)
+static inline void push_block(struct Page *p, int order) 
+{
+    assert(order >= 0 && order <= BUDDY_MAX_ORDER); // 先是检验order的值是否符合正常的范围
+    p->property = ORDER_OF_PAGES(order);   // property=块包含的页数,order_of_pages就是输入order，返回 2^order
+    SetPageProperty(p); //把空闲块头页标识符（PageProperty）置位，表示这是一个空闲块的头页
+    list_add(&flist(order), &(p->page_link)); // 头插到对应阶的链表,flist(order)表示的是对应链表的头节点,用&获取地址，实现连接
+}
+
+// 从order阶对应的空闲表弹出一个块（若无则返回 NULL）
+static struct Page* pop_block(int order) 
+{
+    list_entry_t *le = &flist(order);  // 先是用le指向order阶对应的链表头
+    if (list_empty(le)) // 若对应链表为空，则返回null，表示没有需要的块能pop出来
+        return NULL;
+    le = list_next(le); // 若对应链表不为空，则将le指向链表的第二个block
+    struct Page *p = le2page(le, page_link); // le2page()在memlayout.h内，作用是把指向list_entry_t的指针le转换为指向Page的指针p
+    list_del(le); // 将pop出的块从链表中删去
+    ClearPageProperty(p); // 将p的首位（PageProperty）置0，表示其已不再是一个空闲的block了
+    p->property = 0; // 将p的property变成0，因为理论上当Pageproperty为0时，property就应该设置为0.表示该块已经被分配or非空闲块的头页
+    return p; 
+}
