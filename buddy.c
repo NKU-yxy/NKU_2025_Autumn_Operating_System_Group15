@@ -75,3 +75,70 @@ static struct Page* pop_block(int order)
     p->property = 0; // 将p的property变成0，因为理论上当Pageproperty为0时，property就应该设置为0.表示该块已经被分配or非空闲块的头页
     return p; 
 }
+
+// 在order阶对应的空闲表里精确查找目标块p并删除 
+// 此函数方便后续寻找某块对应的buddy块，方便后续合并，
+// 成功返回1，否则返回0
+static int remove_block_exact(struct Page *p, int order) 
+{
+     assert(order >= 0 && order <= BUDDY_MAX_ORDER); 
+    list_entry_t *le = &flist(order);
+    while ((le = list_next(le)) != &flist(order)) // 从链表头后下一个节点开始遍历（环形）
+    {
+        struct Page *q = le2page(le, page_link); // 依然将指向list_entry_t的指针转换为指向page的指针
+        if (q == p) // 若是所寻找的目标块
+        {
+            list_del(le); // 将指针le删去
+            ClearPageProperty(q); // 将PageProperty置0，表示其不再空闲
+            q->property = 0; // 将property设置为0
+            return 1; // 返回1表示success
+        } 
+    }
+    return 0;
+}
+
+#define BUDDY_NR_FREE (buddy_area.nr_free)
+
+// buddy算法初始化：将所有order的空闲list都设置为空，并且将全局的空闲页计数设置为0，方便后续
+static void buddy_init(void) // 第二个void表示0参数
+{
+    for (int o = 0; o <= BUDDY_MAX_ORDER; ++o) // order从0到max_order，全部用函数list_init（），将双向链表的头项的prev指针和next指针都指向自己，实现每个链表都只有头block
+        list_init(&flist(o));
+    BUDDY_NR_FREE = 0;
+}
+
+// 然后是对物理空间的拆分，将其拆分为2^k的大小的页块，eg.1 2 4 8 16 ...
+// 也就是把 [base, base+n) 这个区间拆成 按对齐的最大 2^k 页块 并且依次挂入空闲表 然后++全局的可用页数
+static void buddy_init_memmap(struct Page *base, size_t n) 
+{
+    assert(n > 0);
+    struct Page *p = base;
+    // 循环把所有的page的标志位flag以及大小属性prperty都设置为0，保证page是干净并且可以分配的
+    for (; p != base + n; ++p) 
+    {
+        assert(PageReserved(p)); // 对page进行检查，保证操作的page得是未被分配的
+        p->flags = p->property = 0; // 置为0
+        set_page_ref(p, 0);  // set_page_ref()在pmm.h内，很简单，就是把p的计数ref设置为0
+    }
+    // 计算起始page的pfn，方便后续对齐
+    size_t pfn = turn_page_to_pfn(base);
+    // while循环负责处理取块--->拆块--->入对应list--->对齐（修改blk）---> buddy_nr_free + blk（增加全局可用页数）
+    while (n > 0) 
+    {
+        int k = 0;
+        // while循环承担两个作用：
+        // 1.找到一个最大的k且满足2^(k+1)<=n 
+        // 2.(GPT帮改的)满足对齐条件，pfn是2^(k+1)的倍数，选出当前位置又能对齐又不会出界的最大的k
+        // 都用k+1而不是k是为了寻找到最大的合法的k，eg. 若n=40 则当k=0就合法了 并且0+1也合法 就这样一直到k=4 发现k=4+1不合法了 所以最后k就是4
+        while (k + 1 <= BUDDY_MAX_ORDER && (ORDER_OF_PAGES(k + 1) <= n) && ((pfn & (ORDER_OF_PAGES(k + 1) - 1)) == 0)) 
+        {
+            k++;
+        }
+        push_block(base, k); // 将地址base对应的page设置为初始page,大小为2^k的自由page组成的块插入order为k对应的链表并设置属性（函数在line 70）
+        size_t blk = ORDER_OF_PAGES(k); // blk表示新增加的页数--2^k个page
+        base += blk; // 基地址对应偏移
+        pfn  += blk; // pfn同步偏移
+        n    -= blk; // n减掉已经分配了的npage，接着循环
+        BUDDY_NR_FREE += blk; // 全局空闲页+blk
+    }
+}
