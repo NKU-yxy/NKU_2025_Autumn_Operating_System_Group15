@@ -42,6 +42,7 @@ buddy_init_memmap(struct Page *base, size_t n) {
     }
 
     size_t offset = 0;
+    size_t total = n;
     while (n > 0) {
         int order = MAX_ORDER - 1;
         while ((1U << order) > n)
@@ -54,7 +55,7 @@ buddy_init_memmap(struct Page *base, size_t n) {
         offset += (1U << order);
         n -= (1U << order);
     }
-    cprintf("[Buddy] Initialized memory map: %zu pages (%d orders)\n", n, MAX_ORDER);
+    cprintf("[Buddy] Initialized memory map: %lu pages (%d orders)\n", (unsigned long)total, MAX_ORDER);
 }
 
 // ====================== 分配 ======================
