@@ -142,3 +142,96 @@ static void buddy_init_memmap(struct Page *base, size_t n)
         BUDDY_NR_FREE += blk; // 全局空闲页+blk
     }
 }
+
+// 返回o阶对应的链表的块首的buddy的头页指针
+// 为什么需要？ 
+// 因为后续合并需要判断buddy是否闲，必须知道buddy的头指针才能访问property属性来确定是否闲
+// 如何得到buddy_pfn?
+// 直接和2^o 异或 就行 
+// eg. o=3 原先pfn=b11000(24) 这样2^o＝b01000 异或得到: b10000(16) [24...31]的buddy就是[16...23]
+static inline struct Page *buddy_of(struct Page *p, int o) 
+{
+    size_t s   = ORDER_OF_PAGES(o); // s = 1^o 得到页数/大小
+    size_t p_pfn = turn_page_to_pfn(p); // 获得p的pfn
+    size_t buddy_pfn = p_pfn ^ s; // 一个块的pfn和其buddy的pfn只差了第o位，所以我们直接反转第o位就能得到伙伴的pfn 这里我们通过和s异或就能得到对应的buddy_pfn
+    return p + (size_t)(buddy_pfn - p_pfn);
+}
+
+// 检查p是否为头page：将p转换为pfn后与s_pages相除，看余数是否为0，若为0则证明已经对齐，即是头page
+#define check_if_head_page(p, s_pages) ( ( (turn_page_to_pfn(p)) % (s_pages) == 0 ) )
+
+// 将以p为头的2^o页的空闲块释放到空闲List，并尽量和同阶的buddy块连续合并后再放回对应的阶的链表内
+static void free_one_block_and_merge(struct Page *p, int o) 
+{
+    size_t s = ORDER_OF_PAGES(o); // s = 2^o 
+
+    assert(check_if_head_page(p, s)); // 检查p是否为头page
+    p->property = s; // 写入块大小s
+    SetPageProperty(p); // 将PageProperty置1，表示是头page
+
+    // 从小到大尝试合并,max是最大阶max_order
+    while (o < BUDDY_MAX_ORDER) 
+    {
+        // page指针q指向p的buddy page
+        struct Page *q = buddy_of(p, o);
+
+        // q不能越界，进行检查
+        if (q < pages || q >= pages + npage)
+            break;
+        // 若伙伴不是空闲的头 or 大小不相同就停止合并
+        if (!PageProperty(q) || q->property != s) 
+            break;
+
+        // 若大小合适且空闲 就摘出来并且把PageProperty置0 表示不再是free的头page了
+        list_del(&q->page_link);
+        ClearPageProperty(q); // 置0
+
+        // 选择更小的头page作为合并后的新的头page
+        if (q < p) 
+            p = q;
+        // 阶数 o++ && s=s*2
+        s <<= 1; 
+        o++;
+        assert(check_if_head_page(p, s)); // 接着检查新的头有没有对齐
+        // 更新peoperty属性 变为新的s(s=原先的2倍)
+        p->property = s;
+        SetPageProperty(p);  // 接着把p的PageProperty设置为1，表示是头page
+    }
+    // 把得到的新合并的挂到对应的o的free list
+    list_add(&flist(o), &p->page_link);
+}
+
+// 将区间[base,base+n)释放
+static void buddy_free_pages(struct Page *base, size_t n) 
+{
+    assert(n > 0);
+    // 先把释放page的引用计数ref设置为0
+    for (struct Page *p = base; p != base + n; ++p) 
+    {
+        // 保证这一页不是保留页并且也不是free的再进行操作
+        assert(!PageReserved(p));
+        assert(!PageProperty(p));
+
+        set_page_ref(p, 0); // set_page_ref()在pmm.h内，很简单，就是把p的计数ref设置为0
+    }
+
+    size_t base_pfn = turn_page_to_pfn(base);
+    size_t remaining_n = n;
+    while (remaining_n > 0) 
+    {
+        int k = 0;
+        // 依然找到尽量大的且合法的k
+        while (k + 1 <= BUDDY_MAX_ORDER && ORDER_OF_PAGES(k + 1) <= remaining_n && ((base_pfn & (ORDER_OF_PAGES(k + 1) - 1)) == 0)) 
+        {
+            k++;
+        }
+        // 将以p为头的2^k页的空闲块释放到空闲List，并尽量和同阶的buddy块连续合并后再放回对应的阶的链表内
+        free_one_block_and_merge(base, k);
+
+        size_t blk = ORDER_OF_PAGES(k); // blk = 2^k
+        base += blk; 
+        base_pfn  += blk;
+        remaining_n -= blk; 
+    }
+    BUDDY_NR_FREE += n;  // 统一加n n长度的区间释放就会得到新的n页
+}
