@@ -1,3 +1,56 @@
+/*
+// ----- 设计文档 -----------------------------------------------------------------------------------//
+
+全流程： 获取一个需求(请求大小为n page的内存) 
+        ---> 分配(alloc) 向上取整到2^k(n<=2^k) 然后尝试分配2^k大小的block，不行就接着k++
+        ---> 拆分(split) 从申请到的block拆分出一个大小为n page的块 剩下的返回free list中 然后对buddy_nr_free减n
+        ---> 这样就成功申请并且分配了一个大小为n page的连续内存
+
+        申请完后释放（free）大小为n page的内存:
+        ---> 释放(free) 利用while循环 尽量将大小为n的拆分成大的且大小满足 2^k的block 一直循环拆 最小拆成2^0=1的块 并且对buddy_nr_free加n
+        ---> 合并(merge) 将free后的散块按照从小到大进行合并 就像游戏2048那样 然后再将无法再变大的block插入回对应order的free list
+        ---> 至此释放一个大小为n page的内存
+
+代码实现：
+    函数： 
+    • ORDER_OF_PAGES(o)：把阶数 o 变成页数 2^o。
+    • find_upper_number(n)：把 n 向上凑成最小的 2^k，返回 k。
+    • turn_page_to_pfn(p) / turn_pfn_to_page(pfn)：Page* 和 PFN 来回转。
+    • push_block(p, o)：把以 p 为头、大小 2^o 的空闲块丢进 o 阶链表，打上头页标记。
+    • pop_block(o)：从 o 阶链表拿一个块，去掉头页标记并返回头页指针。
+    • remove_block_exact(p, o)：在 o 阶链表里精确把块 p 删掉。
+    • buddy_of(p, o)：用 pfn ^ 2^o 找 p 的伙伴块头页。
+    • check_if_head_page(p, s)：判断 p 是否对齐到 s=2^o，是头页就对齐。
+
+    变量：
+    • buddy_area.free_lists[o]：每个阶一个双向环链，存空闲头块。
+    • buddy_area.nr_free：当前空闲页总数。
+    • 宏：BUDDY_NR_FREE 是上面的别名，读写方便。
+
+    流程：
+    1.init logic：
+    buddy_init()：把每个阶的链表设成空环，BUDDY_NR_FREE=0。
+    buddy_init_memmap(base, n)：将所有物理内存进行分配，切分为2^o大小后 对应插入o对用的双向链表 最后各阶链表只含对齐好的 2^o 大小的块
+
+    2.分块logic:
+    split_block(head, bigger_order, n): 拆的时候始终保持两半都对齐到 2^(o-1)，未用半块都回收到对应阶。
+
+    3.alloc logic:
+    buddy_alloc_pages(n)：对于输入n 计算需要的阶need(n<=2^need) 从need阶从小到大找 找到一个block后再调用split拆出大小恰好为n的块 然后buddy_nr_free减去n
+
+    4.free logic:
+    buddy_free_pages(base, n)：利用while循环将连续大小为n的区间按“最大且对齐的 2^o”切开 并且将buddy_nr_free加n
+    free_one_block_and_merge(p, o)：实现block合并,从小到大尝试合并，合并完后挂回对应阶的list
+
+    5.check logic:
+    check_each_list_block(tag)：数每阶块数 × 大小，和理论上应等于 nr_free_pages()
+    buddy_own_check()：分配 n=1,2,3 再乱序释放 然后观察buddy_nr_free是否符合需求 符合就打印success
+
+
+// ----- END -----------------------------------------------------------------------------------//
+
+*/
+
 #include <pmm.h>
 #include <list.h>
 #include <string.h>
@@ -6,7 +59,17 @@
 #include <stdio.h>   
 
 #define BUDDY_MAX_ORDER   16              // 支持到 2^16 页
-#define ORDER_OF_PAGES(o) (1U << (o)) 
+
+// 输入o 返回2^o 即对应的大小
+static inline size_t ORDER_OF_PAGES(unsigned o) 
+{
+    return (size_t)1 << o;
+}
+
+// 解决pmm.c内nr_free_pages曾被定义为函数的问题 方便后面当变量写
+#ifdef nr_free_pages
+#undef nr_free_pages
+#endif
 
 // 多阶空闲表与总空闲页数
 static struct
@@ -15,6 +78,12 @@ static struct
     size_t nr_free;                               // 以“页”为单位
 } buddy_area;
 
+// 方便后续统计全局free的页数 对于nr_free进行修改
+#define BUDDY_NR_FREE (buddy_area.nr_free)
+
+// 定义flist 方便后续 flist意思就是list的第一个 也就是头
+#define flist(order) (buddy_area.free_lists[(order)])
+
 // 对输入的页数n向上取到2^k次方，eg. n=3 --> k=2（2^2=4）
 static inline int find_upper_number(size_t n) 
 {
@@ -22,7 +91,7 @@ static inline int find_upper_number(size_t n)
     size_t v = 1;
     while (v < n) 
     { 
-        v=v*2;
+        v=v<<1;
         k++; 
     }
     return k;
@@ -49,9 +118,6 @@ static inline struct Page* turn_pfn_to_page(size_t pfn)
     // 然后返回&pages[idx] 这样就返回了对应的page指针
     return pa2page((pfn << PGSHIFT)); 
 }
-
-// 定义flist方便后续写，flist(order)即为order阶对应的list的表头
-#define flist(order) (buddy_area.free_lists[(order)])
 
 // 把一个“空闲块头页”p 插入 order阶对应的空闲表，并设置空闲&头页属性(原函数在memlayout.h内)
 static inline void push_block(struct Page *p, int order) 
@@ -96,8 +162,6 @@ static int remove_block_exact(struct Page *p, int order)
     }
     return 0;
 }
-
-#define BUDDY_NR_FREE (buddy_area.nr_free)
 
 // buddy算法初始化：将所有order的空闲list都设置为空，并且将全局的空闲页计数设置为0，方便后续
 static void buddy_init(void) // 第二个void表示0参数
@@ -201,140 +265,6 @@ static void free_one_block_and_merge(struct Page *p, int o)
     list_add(&flist(o), &p->page_link);
 }
 
-// 将区间[base,base+n)释放
-static void buddy_free_pages(struct Page *base, size_t n) 
-{
-    assert(n > 0);
-    // 先把释放page的引用计数ref设置为0
-    for (struct Page *p = base; p != base + n; ++p) 
-    {
-        // 保证这一页不是保留页并且也不是free的再进行操作
-        assert(!PageReserved(p));
-        assert(!PageProperty(p));
-
-        set_page_ref(p, 0); // set_page_ref()在pmm.h内，很简单，就是把p的计数ref设置为0
-    }
-
-    size_t base_pfn = turn_page_to_pfn(base);
-    size_t remaining_n = n;
-    while (remaining_n > 0) 
-    {
-        int k = 0;
-        // 依然找到尽量大的且合法的k
-        while (k + 1 <= BUDDY_MAX_ORDER && ORDER_OF_PAGES(k + 1) <= remaining_n && ((base_pfn & (ORDER_OF_PAGES(k + 1) - 1)) == 0)) 
-        {
-            k++;
-        }
-        // 将以p为头的2^k页的空闲块释放到空闲List，并尽量和同阶的buddy块连续合并后再放回对应的阶的链表内
-        free_one_block_and_merge(base, k);
-
-        size_t blk = ORDER_OF_PAGES(k); // blk = 2^k
-        base += blk; 
-        base_pfn  += blk;
-        remaining_n -= blk; 
-    }
-    BUDDY_NR_FREE += n;  // 统一加n n长度的区间释放就会得到新的n页
-}
-
-// 自己写的 print 函数
-// 检查每一个order对应的free list的空闲块数 累加后与buddy_nr_free_pages对比是否一致
-static size_t check_each_list_block(const char *tag) 
-{
-    size_t total = 0;
-    cprintf("[BUDDY] %s\n", tag);
-    // 遍历每个order的free list
-    for (int o = 0; o <= BUDDY_MAX_ORDER; ++o)
-     {
-        size_t cnt = 0;
-        list_entry_t *head = &flist(o);
-        list_entry_t *le = head;
-        // 环形的list 若le==head 证明已经遍历完了
-        while ((le = list_next(le)) != head) 
-        {
-            struct Page *p = le2page(le, page_link);
-            assert(PageProperty(p)); // 保证必须得是头页且空闲的
-            assert(p->property == ORDER_OF_PAGES(o));  // property必须==2^o 大小要对
-            cnt++; // 都满足就认为是一个合适的 进行++
-        }
-        // 然后 total要 + cnt*2^o
-        size_t pages = cnt * ORDER_OF_PAGES(o);
-        total += pages;
-        cprintf("  order=%2d  blk=%4d  blocks=%5d  pages=%7d\n",
-                o, ORDER_OF_PAGES(o), cnt, pages);
-    }
-    size_t nfree = nr_free_pages();
-    cprintf("  ==> total_pages=%d  nr_free_pages=%d  %s\n",
-            total, nfree, (total == nfree ? "[YES!]" : "[WRONG!]")); // 累加和==nfree 就输出[yes] 不然输出[wrong]
-    assert(total == nfree);
-    return total; 
-}
-
-// 然后进行check
-static void buddy_own_check(void) 
-{
-    // 1.统计alloc前的free_page数量
-    size_t before = check_each_list_block("before");
-
-    // 2) 进行三次分配 n=1,2,3 按照顺序 总共6页
-    // assert()确保分配成功
-    struct Page *a = alloc_pages(1);  
-    assert(a);
-    struct Page *b = alloc_pages(2);  
-    assert(b);
-    struct Page *c = alloc_pages(3);  
-    assert(c);
-    // 再check一下 是不是真的只是消耗了6个page
-    size_t after_alloc = check_each_list_block("after alloc");
-    cprintf("[BUDDY] expect change = -6 pages\n");
-    assert(after_alloc + 6 == before);
-
-    // 3) 打乱释放 检查是否真的能自己释放好page
-    free_pages(c, 3);
-    free_pages(a, 1);
-    free_pages(b, 2);
-
-    size_t after_free = check_each_list_block("after free");
-    cprintf("[BUDDY] expect change = 0 pages\n");
-    assert(after_free == before);
-
-    // 若前面都通过 证明buddy实现成功
-    cprintf("Buddy SUCCESS !\n");
-}
-
-
-// 作用：取出n页连续的物理空间
-// 若n>buddy_nr_free 则证明无法满足 直接返回null
-// 若n<buddy_nr_free,先求出need 满足n<=2^need 然后从need阶及以上对应的free list寻找有无free的块
-// 然后找到合适的块后 再调用split_block对块进行拆分 只拿出n页的大小的块 其余按照对应大小放回free list 
-// 最后更新buddy_nr_free 让其减去n 至此结束
-static struct Page* buddy_alloc_pages(size_t n) 
-{
-    assert(n > 0);
-    if (n > BUDDY_NR_FREE) 
-        return NULL;
-
-    int need = find_upper_number(n);
-    int curr_order = need;
-    struct Page *blk = NULL; // blk保存找到的块的head(从某一>=need阶的free list取出来的块的地址)
-    // 寻找适合的块 从小到大
-    for (; curr_order <= BUDDY_MAX_ORDER; curr_order++)
-    {
-        // 若curr_order阶对应的free list不是空的，则取一块下来作为blk，准备后续拆分
-        if ( !list_empty( &flist( curr_order ) ) ) 
-            { 
-                blk = pop_block(curr_order); 
-                break; 
-            }
-    }
-    // 若遍历后 发现没有适合的块 那就返回Null
-    if (blk == NULL) 
-        return NULL;
-    // 若有合适的块 就对其拆分 只要n page大小 其他还回去
-    struct Page *result = split_block(blk, curr_order, n);
-    BUDDY_NR_FREE -= n;
-    return result;
-}
-
 // 将区间 [base,base+n) 释放
 static void buddy_free_pages(struct Page *base, size_t n) 
 {
@@ -403,6 +333,112 @@ static struct Page* split_block(struct Page *head, int bigger_order, size_t n)
         return head;  // 这一处需要返回head是因为进入递归后函数会返回一个新的head 
                      // 但实际分配的块应该是以最开始的区间的head为head 所以要先返回一个head作为真正的head
     }
+}
+
+
+
+// 作用：取出n页连续的物理空间
+// 若n>buddy_nr_free 则证明无法满足 直接返回null
+// 若n<buddy_nr_free,先求出need 满足n<=2^need 然后从need阶及以上对应的free list寻找有无free的块
+// 然后找到合适的块后 再调用split_block对块进行拆分 只拿出n页的大小的块 其余按照对应大小放回free list 
+// 最后更新buddy_nr_free 让其减去n 至此结束
+static struct Page* buddy_alloc_pages(size_t n) 
+{
+    assert(n > 0);
+    if (n > BUDDY_NR_FREE) 
+        return NULL;
+
+    int need = find_upper_number(n);
+    int curr_order = need;
+    struct Page *blk = NULL; // blk保存找到的块的head(从某一>=need阶的free list取出来的块的地址)
+    // 寻找适合的块 从小到大
+    for (; curr_order <= BUDDY_MAX_ORDER; curr_order++)
+    {
+        // 若curr_order阶对应的free list不是空的，则取一块下来作为blk，准备后续拆分
+        if ( !list_empty( &flist( curr_order ) ) ) 
+            { 
+                blk = pop_block(curr_order); 
+                break; 
+            }
+    }
+    // 若遍历后 发现没有适合的块 那就返回Null
+    if (blk == NULL) 
+        return NULL;
+    // 若有合适的块 就对其拆分 只要n page大小 其他还回去
+    struct Page *result = split_block(blk, curr_order, n);
+    BUDDY_NR_FREE -= n;
+    return result;
+}
+
+// 返回全局的空闲页数
+static size_t buddy_nr_free_pages(void) 
+{ 
+    return BUDDY_NR_FREE; 
+}
+
+// 自己写的 print 函数
+// 检查每一个order对应的free list的空闲块数 累加后与buddy_nr_free_pages对比是否一致
+static size_t check_each_list_block(const char *tag) 
+{
+    size_t total = 0;
+    cprintf("[BUDDY] %s\n", tag);
+    // 遍历每个order的free list
+    for (int o = 0; o <= BUDDY_MAX_ORDER; ++o)
+     {
+        size_t cnt = 0;
+        list_entry_t *head = &flist(o);
+        list_entry_t *le = head;
+        // 环形的list 若le==head 证明已经遍历完了
+        while ((le = list_next(le)) != head) 
+        {
+            struct Page *p = le2page(le, page_link);
+            assert(PageProperty(p)); // 保证必须得是头页且空闲的
+            assert(p->property == ORDER_OF_PAGES(o));  // property必须==2^o 大小要对
+            cnt++; // 都满足就认为是一个合适的 进行++
+        }
+        // 然后 total要 + cnt*2^o
+        size_t pages = cnt * ORDER_OF_PAGES(o);
+        total += pages;
+        cprintf("  order=%2d  blk=%4d  blocks=%5d  pages=%7d\n",
+                o, ORDER_OF_PAGES(o), cnt, pages);
+    }
+    size_t nfree = nr_free_pages();
+    cprintf("  ==> total_pages=%d  nr_free_pages=%d  %s\n",
+            total, nfree, (total == nfree ? "[YES!]" : "[WRONG!]")); // 累加和==nfree 就输出[yes] 不然输出[wrong]
+    assert(total == nfree);
+    return total; 
+}
+
+// 然后进行check
+static void buddy_own_check(void) 
+{
+    // 1.统计alloc前的free_page数量
+    size_t before = check_each_list_block("before");
+
+    // 2) 进行三次分配 n=1,2,3 按照顺序 总共6页
+    // assert()确保分配成功
+    struct Page *a = alloc_pages(1);  
+    assert(a);
+    struct Page *b = alloc_pages(2);  
+    assert(b);
+    struct Page *c = alloc_pages(3);  
+    assert(c);
+    // 再check一下 是不是真的只是消耗了6个page
+    size_t after_alloc = check_each_list_block("after alloc");
+    cprintf("[BUDDY] expect change = -6 pages\n");
+    assert(after_alloc + 6 == before);
+
+    // 3) 打乱释放 检查是否真的能自己释放好page
+    free_pages(c, 3);
+    free_pages(a, 1);
+    free_pages(b, 2);
+
+    size_t after_free = check_each_list_block("after free");
+    cprintf("[BUDDY] expect change = 0 pages\n");
+    assert(after_free == before);
+
+    // 若前面都通过 证明buddy实现成功
+    cprintf("Buddy SUCCESS !\n");
 }
 
 // pmm_manager 实例
