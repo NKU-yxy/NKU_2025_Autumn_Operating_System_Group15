@@ -302,9 +302,108 @@ static void buddy_own_check(void)
 }
 
 
-static struct Page* buddy_alloc_pages(size_t n) ;
+// 作用：取出n页连续的物理空间
+// 若n>buddy_nr_free 则证明无法满足 直接返回null
+// 若n<buddy_nr_free,先求出need 满足n<=2^need 然后从need阶及以上对应的free list寻找有无free的块
+// 然后找到合适的块后 再调用split_block对块进行拆分 只拿出n页的大小的块 其余按照对应大小放回free list 
+// 最后更新buddy_nr_free 让其减去n 至此结束
+static struct Page* buddy_alloc_pages(size_t n) 
+{
+    assert(n > 0);
+    if (n > BUDDY_NR_FREE) 
+        return NULL;
 
-static void buddy_free_pages(struct Page *base, size_t n) ;
+    int need = find_upper_number(n);
+    int curr_order = need;
+    struct Page *blk = NULL; // blk保存找到的块的head(从某一>=need阶的free list取出来的块的地址)
+    // 寻找适合的块 从小到大
+    for (; curr_order <= BUDDY_MAX_ORDER; curr_order++)
+    {
+        // 若curr_order阶对应的free list不是空的，则取一块下来作为blk，准备后续拆分
+        if ( !list_empty( &flist( curr_order ) ) ) 
+            { 
+                blk = pop_block(curr_order); 
+                break; 
+            }
+    }
+    // 若遍历后 发现没有适合的块 那就返回Null
+    if (blk == NULL) 
+        return NULL;
+    // 若有合适的块 就对其拆分 只要n page大小 其他还回去
+    struct Page *result = split_block(blk, curr_order, n);
+    BUDDY_NR_FREE -= n;
+    return result;
+}
+
+// 将区间 [base,base+n) 释放
+static void buddy_free_pages(struct Page *base, size_t n) 
+{
+    assert(n > 0);
+    // 先把释放page的引用计数ref设置为0
+    for (struct Page *p = base; p != base + n; ++p) 
+    {
+        // 保证这一页不是保留页并且也不是free的再进行操作
+        assert(!PageReserved(p));
+        assert(!PageProperty(p));
+
+        set_page_ref(p, 0); // set_page_ref()在pmm.h内，很简单，就是把p的计数ref设置为0
+    }
+
+    size_t base_pfn = turn_page_to_pfn(base);
+    size_t remaining_n = n;
+    while (remaining_n > 0) 
+    {
+        int k = 0;
+        // 依然找到尽量大的且合法的k
+        while (k + 1 <= BUDDY_MAX_ORDER && ORDER_OF_PAGES(k + 1) <= remaining_n && ((base_pfn & (ORDER_OF_PAGES(k + 1) - 1)) == 0)) 
+        {
+            k++;
+        }
+        // 将以p为头的2^k页的空闲块释放到空闲List，并尽量和同阶的buddy块连续合并后再放回对应的阶的链表内
+        free_one_block_and_merge(base, k);
+
+        size_t blk = ORDER_OF_PAGES(k); // blk = 2^k
+        base += blk; 
+        base_pfn  += blk;
+        remaining_n -= blk; 
+    }
+    BUDDY_NR_FREE += n;  // 统一加n n长度的区间释放就会得到新的n页
+}
+
+
+// 将大区间拆分为两部分，一部分为需要的n页，另一部分作为新的remianing
+// 递归实现
+static struct Page* split_block(struct Page *head, int bigger_order, size_t n) 
+{
+    size_t whole = ORDER_OF_PAGES(bigger_order);
+    // Case 1:最简单的情况 =无需拆分 直接返回head即可
+    if (n == whole) 
+        return head;
+
+    size_t half = whole >> 1;
+    // Page一分为二 left指向head的地址 right指向(head+half)
+    struct Page *left  = head; 
+    struct Page *right = head + half;
+    // Case 2: 需要的n页较小，n<half 则将左半部分接着拆分 右半边原封不动回收
+    if (n <= half) 
+    {
+        // 将右半边空间回收
+        push_block(right, bigger_order - 1);
+        // 左半边递归
+        return split_block(left, bigger_order - 1, n);
+    } 
+    // Case 3:需要的n较大 则左半边的half页+右边的(n-half)页拿来分配
+    // case3待补充 为什么要多return一个head????
+    else 
+    {
+        // 对右半边接着递归 分配所需要的
+        struct Page* temp= split_block(right, bigger_order - 1, n - half);
+        // 接着调用右边最后会递归的返回一个page*，但我们其实并不需要这个指针 所以直接void掉 也可以写成:(void)split_block(right, bigger_order - 1, n - half);
+        (void) temp;
+        return head;  // 这一处需要返回head是因为进入递归后函数会返回一个新的head 
+                     // 但实际分配的块应该是以最开始的区间的head为head 所以要先返回一个head作为真正的head
+    }
+}
 
 // pmm_manager 实例
 const struct pmm_manager buddy_pmm_manager = {
