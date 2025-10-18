@@ -1,0 +1,45 @@
+全流程： 获取一个需求(请求大小为n page的内存) 
+        ---> 分配(alloc) 向上取整到2^k(n<=2^k) 然后尝试分配2^k大小的block，不行就接着k++
+        ---> 拆分(split) 从申请到的block拆分出一个大小为n page的块 剩下的返回free list中 然后对buddy_nr_free减n
+        ---> 这样就成功申请并且分配了一个大小为n page的连续内存
+
+        申请完后释放（free）大小为n page的内存:
+        ---> 释放(free) 利用while循环 尽量将大小为n的拆分成大的且大小满足 2^k的block 一直循环拆 最小拆成2^0=1的块 并且对buddy_nr_free加n
+        ---> 合并(merge) 将free后的散块按照从小到大进行合并 就像游戏2048那样 然后再将无法再变大的block插入回对应order的free list
+        ---> 至此释放一个大小为n page的内存
+
+代码实现：
+    函数： 
+    • ORDER_OF_PAGES(o)：把阶数 o 变成页数 2^o。
+    • find_upper_number(n)：把 n 向上凑成最小的 2^k，返回 k。
+    • turn_page_to_pfn(p) / turn_pfn_to_page(pfn)：Page* 和 PFN 来回转。
+    • push_block(p, o)：把以 p 为头、大小 2^o 的空闲块丢进 o 阶链表，打上头页标记。
+    • pop_block(o)：从 o 阶链表拿一个块，去掉头页标记并返回头页指针。
+    • remove_block_exact(p, o)：在 o 阶链表里精确把块 p 删掉。
+    • buddy_of(p, o)：用 pfn ^ 2^o 找 p 的伙伴块头页。
+    • check_if_head_page(p, s)：判断 p 是否对齐到 s=2^o，是头页就对齐。
+
+    变量：
+    • buddy_area.free_lists[o]：每个阶一个双向环链，存空闲头块。
+    • buddy_area.nr_free：当前空闲页总数。
+    • 宏：BUDDY_NR_FREE 是上面的别名，读写方便。
+
+    流程：
+    1.init logic：
+    buddy_init()：把每个阶的链表设成空环，BUDDY_NR_FREE=0。
+    buddy_init_memmap(base, n)：将所有物理内存进行分配，切分为2^o大小后 对应插入o对用的双向链表 最后各阶链表只含对齐好的 2^o 大小的块
+
+    2.分块logic:
+    split_block(head, bigger_order, n): 拆的时候始终保持两半都对齐到 2^(o-1)，未用半块都回收到对应阶。
+
+    3.alloc logic:
+    buddy_alloc_pages(n)：对于输入n 计算需要的阶need(n<=2^need) 从need阶从小到大找 找到一个block后再调用split拆出大小恰好为n的块 然后buddy_nr_free减去n
+
+    4.free logic:
+    buddy_free_pages(base, n)：利用while循环将连续大小为n的区间按“最大且对齐的 2^o”切开 并且将buddy_nr_free加n
+    free_one_block_and_merge(p, o)：实现block合并,从小到大尝试合并，合并完后挂回对应阶的list
+
+    5.check logic:
+    check_each_list_block(tag)：数每阶块数 × 大小，和理论上应等于 nr_free_pages()
+    buddy_own_check()：分配 n=1,2,3 再乱序释放 然后观察buddy_nr_free是否符合需求 符合就打印success
+    
