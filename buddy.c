@@ -235,3 +235,84 @@ static void buddy_free_pages(struct Page *base, size_t n)
     }
     BUDDY_NR_FREE += n;  // 统一加n n长度的区间释放就会得到新的n页
 }
+
+// 自己写的 print 函数
+// 检查每一个order对应的free list的空闲块数 累加后与buddy_nr_free_pages对比是否一致
+static size_t check_each_list_block(const char *tag) 
+{
+    size_t total = 0;
+    cprintf("[BUDDY] %s\n", tag);
+    // 遍历每个order的free list
+    for (int o = 0; o <= BUDDY_MAX_ORDER; ++o)
+     {
+        size_t cnt = 0;
+        list_entry_t *head = &flist(o);
+        list_entry_t *le = head;
+        // 环形的list 若le==head 证明已经遍历完了
+        while ((le = list_next(le)) != head) 
+        {
+            struct Page *p = le2page(le, page_link);
+            assert(PageProperty(p)); // 保证必须得是头页且空闲的
+            assert(p->property == ORDER_OF_PAGES(o));  // property必须==2^o 大小要对
+            cnt++; // 都满足就认为是一个合适的 进行++
+        }
+        // 然后 total要 + cnt*2^o
+        size_t pages = cnt * ORDER_OF_PAGES(o);
+        total += pages;
+        cprintf("  order=%2d  blk=%4d  blocks=%5d  pages=%7d\n",
+                o, ORDER_OF_PAGES(o), cnt, pages);
+    }
+    size_t nfree = nr_free_pages();
+    cprintf("  ==> total_pages=%d  nr_free_pages=%d  %s\n",
+            total, nfree, (total == nfree ? "[YES!]" : "[WRONG!]")); // 累加和==nfree 就输出[yes] 不然输出[wrong]
+    assert(total == nfree);
+    return total; 
+}
+
+// 然后进行check
+static void buddy_own_check(void) 
+{
+    // 1.统计alloc前的free_page数量
+    size_t before = check_each_list_block("before");
+
+    // 2) 进行三次分配 n=1,2,3 按照顺序 总共6页
+    // assert()确保分配成功
+    struct Page *a = alloc_pages(1);  
+    assert(a);
+    struct Page *b = alloc_pages(2);  
+    assert(b);
+    struct Page *c = alloc_pages(3);  
+    assert(c);
+    // 再check一下 是不是真的只是消耗了6个page
+    size_t after_alloc = check_each_list_block("after alloc");
+    cprintf("[BUDDY] expect change = -6 pages\n");
+    assert(after_alloc + 6 == before);
+
+    // 3) 打乱释放 检查是否真的能自己释放好page
+    free_pages(c, 3);
+    free_pages(a, 1);
+    free_pages(b, 2);
+
+    size_t after_free = check_each_list_block("after free");
+    cprintf("[BUDDY] expect change = 0 pages\n");
+    assert(after_free == before);
+
+    // 若前面都通过 证明buddy实现成功
+    cprintf("Buddy SUCCESS !\n");
+}
+
+
+static struct Page* buddy_alloc_pages(size_t n) ;
+
+static void buddy_free_pages(struct Page *base, size_t n) ;
+
+// pmm_manager 实例
+const struct pmm_manager buddy_pmm_manager = {
+    .name = "buddy_pmm_manager",
+    .init = buddy_init,
+    .init_memmap = buddy_init_memmap,
+    .alloc_pages = buddy_alloc_pages,
+    .free_pages = buddy_free_pages,
+    .nr_free_pages = buddy_nr_free_pages,
+    .check = buddy_own_check
+};
