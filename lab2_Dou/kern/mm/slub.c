@@ -4,18 +4,138 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
-
 /*
- * Simplified SLUB-like allocator for the lab (two-layer):
- * - Layer 1: use alloc_pages/free_pages to get whole pages (unit: PAGE)
- * - Layer 2: maintain caches for object sizes (power-of-two buckets)
+ * ------------------------ SLUB 设计文档
  *
- * Simplifications and choices:
- * - Page size = PGSIZE; objects are carved from pages returned by alloc_pages(1)
- * - Buckets: sizes 8,16,32,64,128,256,512,1024,2048 (up to half page)
- * - Each page used for slab contains a small header (slab_page_t) at its start
- * - Per-bucket free-list stores free objects
- * - No per-CPU caches, no red-zones, no partial-ordering. Focus on correctness.
+ * ------------ SLUB 原理概述
+ * SLUB（Slab Utilization By-pass）是 Linux 内核中的一种内存分配器，
+ * 专门用于高效地管理内核中的小对象。
+ * 它是 SLAB 分配器的改进版本，旨在提高性能、简化实现并减少内存碎片。
+ * 在现代 Linux 内核中，SLUB 是默认的分配器，广泛用于分配和回收内核数据结构，
+ * 如 task_struct、inode、file 等。
+ *
+ * ------------ 本实验简化版 SLUB 的核心目标
+ * 我们实现了一个 **两层架构的简化版 SLUB 分配器**：
+ *   - 第一层：基于页的分配（使用 alloc_pages/free_pages）
+ *   - 第二层：基于固定大小对象的分配（通过 slab cache 管理）
+ *
+ * 整体思路：
+ *   当用户调用 kmalloc() 时：
+ *     1. 如果请求的对象较小（≤ 2048B），进入 SLUB 层分配；
+ *     2. 如果请求的对象较大，则直接使用 alloc_pages() 分配整页。
+ *
+ * ------------ SLUB 的主要机制
+ *
+ * 1. 缓存 (Cache)
+ *    - 每种对象大小对应一个 cache（slab_cache_t）。
+ *    - cache 维护多个 slab_page_t（每个 slab_page 管理多个对象）。
+ *    - 本实验中定义的 9 个桶大小：
+ *         bucket_size = {8,16,32,64,128,256,512,1024,2048}
+ *      每个 cache 管理对应大小的对象。
+ *
+ * 2. Slab Page
+ *    - 每个 slab page 占用一整页（PGSIZE）。
+ *    - 页首保存 slab_page_t 结构体（slab 元信息），
+ *      后面依次存储多个固定大小的对象。
+ *    - slab_page_t 主要成员：
+ *          list_entry_t list;    // 链入 cache
+ *          slab_obj_t *free;     // 当前空闲对象链表
+ *          size_t obj_size;      // 对象大小
+ *          size_t nr_free;       // 当前空闲对象数
+ *          size_t capacity;      // 该页可容纳对象总数
+ *
+ * 3. 对象分配与释放流程
+ *
+ *   (1) 分配（kmalloc）：
+ *       - 根据请求 size 选择对应的 bucket；
+ *       - 遍历 cache->pages，寻找有空闲对象的 slab_page；
+ *       - 若找到，则弹出一个对象并返回；
+ *       - 若没有合适页，则：
+ *            a. 通过 alloc_pages(1) 分配一页；
+ *            b. 初始化 slab_page_t；
+ *            c. 将该页挂入 cache->pages；
+ *            d. 从该页分配一个对象返回。
+ *
+ *   (2) 释放（kfree）：
+ *       - 根据虚拟地址推算其所在页；
+ *       - 确认该页是 slab 页；
+ *       - 将对象重新挂回 slab_page_t->free；
+ *       - 若该页完全空闲，则释放整页并从 cache 移除。
+ *
+ * ------------ 关键数据结构
+ *
+ * typedef struct slab_obj {
+ *     struct slab_obj *next;
+ * } slab_obj_t;
+ *
+ * typedef struct slab_page {
+ *     list_entry_t list;   // 链入 cache 的 page 链表
+ *     slab_obj_t *free;    // 空闲对象链表
+ *     size_t obj_size;     // 对象大小
+ *     size_t nr_free;      // 当前空闲数量
+ *     size_t capacity;     // 总容量
+ * } slab_page_t;
+ *
+ * typedef struct slab_cache {
+ *     size_t size;          // 管理对象大小
+ *     list_entry_t pages;   // 所有 slab_page_t 的链表
+ *     slab_obj_t *global_free; // 全局备用空闲链（简化版中未使用）
+ *     unsigned int nr_pages;   // 当前缓存的页数
+ * } slab_cache_t;
+ *
+ * static slab_cache_t caches[MAX_BUCKET];
+ *
+ * ------------ 核心函数实现
+ *
+ * 1. slub_init()
+ *    - 初始化 9 个缓存桶；
+ *    - 对每个 cache 初始化链表；
+ *
+ * 2. slab_page_init()
+ *    - 初始化一页 slab，包括对象链表和元信息；
+ *
+ * 3. kmalloc(size_t size)
+ *    - 若 size 超过最大桶，则使用 alloc_pages()；
+ *    - 否则在对应 cache 查找空闲对象；
+ *    - 若所有页满，创建新 slab page；
+ *
+ * 4. kfree(void *ptr)
+ *    - 通过虚拟地址反推 slab_page；
+ *    - 检查有效性、防止 double free；
+ *    - 将对象重新挂回 free 链；
+ *    - 若该页完全空闲，释放整页；
+ *
+ * 5. slub_check()
+ *    - 自动测试整个分配/释放机制：
+ *      a. 批量分配多种大小对象；
+ *      b. 释放一半对象；
+ *      c. 再次分配以验证复用；
+ *      d. 释放全部对象；
+ *      e. 检查页数是否恢复；
+ *
+ * ------------ 设计特点与取舍
+ *
+ * ✅ 优点：
+ *   - 实现简单，结构清晰；
+ *   - 基本复现了 Linux SLUB 的分层思想；
+ *   - 支持动态增长的 per-size cache；
+ *   - 具备完整测试与状态打印。
+ *
+ * ⚠️ 简化点：
+ *   - 无 per-CPU cache；
+ *   - 无 partial/full/empty 状态区分；
+ *   - 未实现对象对齐优化；
+ *   - 释放时需遍历查找（O(n)）。
+ *
+ * ------------ 调试接口
+ *   - slub_dump_state(tag)：打印当前各 cache 状态；
+ *   - slub_check()：自动化完整测试。
+ *
+ * ------------ 总结
+ * 本实验通过实现一个简化的 SLUB 分配器，
+ * 体现了 Linux 内核中小对象分配器的核心思想：
+ *   —— 层次化的内存管理、按对象大小缓存、快速复用。
+ * 尽管省略了复杂的性能优化，但完整展示了内核内存分配器的基本机制与逻辑。
  */
 
 #define MAX_BUCKET 9
