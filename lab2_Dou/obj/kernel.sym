@@ -1,7 +1,7 @@
 ffffffffc0200000 .text
 ffffffffc0201918 .rodata
-ffffffffc02024e8 .srodata.cst8
-ffffffffc02024f0 .srodata.nbase
+ffffffffc0202538 .srodata.cst8
+ffffffffc0202540 .srodata.nbase
 ffffffffc0203000 .data
 ffffffffc0206010 .sdata
 ffffffffc0206018 .bss
@@ -38,10 +38,10 @@ ffffffffc0206018 free_area
 ffffffffc0200e96 kmalloc.part.0
 ffffffffc020101c slub_dump_state
 ffffffffc02060e0 caches
-ffffffffc0202258 bucket_size
+ffffffffc02022a8 bucket_size
 0000000000000000 printfmt.c
 ffffffffc020147e printnum
-ffffffffc02024b0 error_string
+ffffffffc0202500 error_string
 0000000000000000 sbi.c
 0000000000000000 string.c
 ffffffffc020004a print_kerninfo
@@ -84,7 +84,7 @@ ffffffffc020012c vcprintf
 ffffffffc0200182 cputs
 ffffffffc0205000 bootstacktop
 ffffffffc0203000 bootstack
-ffffffffc02024f0 nbase
+ffffffffc0202540 nbase
 ffffffffc0201886 strlen
 ffffffffc0200220 dtb_init
 ffffffffc0206268 pages
