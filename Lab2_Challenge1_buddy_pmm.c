@@ -323,7 +323,6 @@ static struct Page* split_block(struct Page *head, int bigger_order, size_t n)
         return split_block(left, bigger_order - 1, n);
     } 
     // Case 3:需要的n较大 则左半边的half页+右边的(n-half)页拿来分配
-    // case3待补充 为什么要多return一个head????
     else 
     {
         // 对右半边接着递归 分配所需要的
