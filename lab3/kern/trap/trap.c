@@ -6,6 +6,7 @@
 #include <memlayout.h>
 #include <mmu.h>
 #include <riscv.h>
+#include <sbi.h>
 #include <stdio.h>
 #include <trap.h>
 
@@ -18,6 +19,9 @@ static void print_ticks() {
     panic("EOT: kernel seems ok.");
 #endif
 }
+
+// count how many times we've printed "100 ticks"
+static size_t tick_print_times = 0;
 
 /* idt_init - initialize IDT to each of the entry points in kern/trap/vectors.S
  */
@@ -130,6 +134,16 @@ void interrupt_handler(struct trapframe *tf) {
              *(3)当计数器加到100的时候，我们会输出一个`100ticks`表示我们触发了100次时钟中断，同时打印次数（num）加一
             * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
             */
+            clock_set_next_event();
+            extern volatile size_t ticks;
+            ticks++;
+            if (ticks % TICK_NUM == 0) {
+                print_ticks();
+                tick_print_times++;
+                if (tick_print_times >= 10) {
+                    sbi_shutdown();
+                }
+            }
             break;
         case IRQ_H_TIMER:
             cprintf("Hypervisor software interrupt\n");
@@ -168,14 +182,28 @@ void exception_handler(struct trapframe *tf) {
              *(2)输出异常指令地址
              *(3)更新 tf->epc寄存器
             */
+            cprintf("Illegal instruction caught at 0x%08x\n", tf->epc);
+            cprintf("Exception type:Illegal instruction\n");
+            {
+                // advance sepc to skip the faulting instruction (handle RVC)
+                uint16_t first_half = *(uint16_t *)(tf->epc);
+                tf->epc += ((first_half & 0x3) == 0x3) ? 4 : 2;
+            }
             break;
         case CAUSE_BREAKPOINT:
             //断点异常处理
-            /* LAB3 CHALLLENGE3   YOUR CODE :  */
+            /* LAB3 CHALLENGE3   YOUR CODE :  */
             /*(1)输出指令异常类型（ breakpoint）
              *(2)输出异常指令地址
              *(3)更新 tf->epc寄存器
             */
+            cprintf("ebreak caught at 0x%08x\n", tf->epc);
+            cprintf("Exception type: breakpoint\n");
+            {
+                // advance sepc to skip the breakpoint instruction (handle RVC)
+                uint16_t first_half = *(uint16_t *)(tf->epc);
+                tf->epc += ((first_half & 0x3) == 0x3) ? 4 : 2;
+            }
             break;
         case CAUSE_MISALIGNED_LOAD:
             break;
