@@ -35,6 +35,21 @@ int kern_init(void) {
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
 
+    // ==== Challenge3 quick self-test (optional) ====
+    // Enable by building with: EXTRAFLAGS='-DCH3_SELFTEST'
+    // Example: make EXTRAFLAGS='-DCH3_SELFTEST' -C lab3 qemu
+    #ifdef CH3_SELFTEST
+    cprintf("[CH3] trigger ebreak (breakpoint) test...\n");
+    __asm__ __volatile__("ebreak");
+    cprintf("[CH3] returned after breakpoint handler.\n");
+
+    cprintf("[CH3] trigger illegal instruction (mret in S-mode) test...\n");
+    // Encode mret (privileged to M-mode) as a raw 32-bit instruction.
+    // This will cause an Illegal instruction exception in S-mode.
+    __asm__ __volatile__(".4byte 0x30200073"); // MATCH_MRET from riscv.h
+    cprintf("[CH3] returned after illegal-instruction handler.\n");
+    #endif
+
     /* do nothing */
     while (1)
         ;
