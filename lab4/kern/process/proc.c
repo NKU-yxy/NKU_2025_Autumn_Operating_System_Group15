@@ -104,6 +104,7 @@ alloc_proc(void)
          *       uint32_t flags;                             // Process flag
          *       char name[PROC_NAME_LEN + 1];               // Process name
          */
+      //学号：2311973
         proc->state = PROC_UNINIT;  // 初始化为未初始化状态
         proc->pid = -1;             // 临时无效PID
         proc->runs = 0;             // 运行次数初始化为0
@@ -198,6 +199,7 @@ void proc_run(struct proc_struct *proc)
          *   lsatp():                   Modify the value of satp register
          *   switch_to():              Context switching between two processes
          */
+      //学号：2312189
         struct proc_struct *prev = current;
          bool intr_flag;                  // 声明中断标志变量
         local_intr_save(intr_flag);      // 传入变量作为参数
@@ -334,7 +336,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      *   proc_list:    the process set's list
      *   nr_process:   the number of process set
      */
-
+//学号：2312900
     // 1.分配进程控制块  
      if ((proc = alloc_proc()) == NULL)
     {
