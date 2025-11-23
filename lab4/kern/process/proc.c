@@ -114,7 +114,7 @@ alloc_proc(void)
         proc->mm = NULL;            // 内存管理结构为空（内核线程）
         memset(&proc->context, 0, sizeof(struct context)); // 上下文清零
         proc->tf = NULL;            // 陷阱帧初始化为空
-        proc->pgdir = 0;            // 页目录初始化为0
+        proc->pgdir = boot_pgdir_pa;            // 页目录初始化为引导页目录地址
         proc->flags = 0;            // 标志位清零
         memset(proc->name, 0, PROC_NAME_LEN + 1); // 进程名清零
         list_init(&proc->list_link); // 初始化进程链表项
