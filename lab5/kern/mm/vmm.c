@@ -201,30 +201,122 @@ int mm_map(struct mm_struct *mm, uintptr_t addr, size_t len, uint32_t vm_flags,
 out:
     return ret;
 }
-
+/* 
+1. COW 解决的问题
+fork 系统调用需要为子进程创建独立的地址空间，但如果直接复制父进程所有物理内存页，会导致：
+• 时间开销极大（复制大量内存）；
+• 内存浪费（父子进程大概率短期内只读共享数据，复制无意义）。
+2. COW 核心逻辑
+• fork 阶段（dup_mmap 执行时）：
+父子进程共享物理内存页，仅复制页表项，并将页表项标记为「只读 + COW 标志」；
+• 写操作阶段：
+当任一进程尝试写入该页时，CPU 触发「写权限缺失」缺页异常，内核此时才为该进程复制物理页，修改页表项为「可写」，解除 COW 标志，实现 “写时才真正复制”。
+*/
+// dup_mmap() 为子进程创建与父进程完全一致的虚拟内存区域（VMA），并配置页表项为 COW 模式
 int dup_mmap(struct mm_struct *to, struct mm_struct *from)
 {
+    // 确保目标（子进程）和源（父进程）mm_struct 非空
     assert(to != NULL && from != NULL);
-    list_entry_t *list = &(from->mmap_list), *le = list;
+    list_entry_t *list = &(from->mmap_list), *le = list; // 初始化遍历父进程VMA链表的指针
+    // 反向遍历父进程的所有VMA（list_prev 是链表前驱遍历，保证顺序）
+    // VMA 是虚拟内存区域（如代码段、数据段、堆、栈），遍历所有VMA才能覆盖整个用户地址空间
     while ((le = list_prev(le)) != list)
     {
         struct vma_struct *vma, *nvma;
-        vma = le2vma(le, list_link);
-        nvma = vma_create(vma->vm_start, vma->vm_end, vma->vm_flags);
+        vma = le2vma(le, list_link); // 将链表节点（le）转换为包含该节点的vma_struct指针
+        nvma = vma_create(vma->vm_start, vma->vm_end, vma->vm_flags); // 为子进程创建与父进程VMA完全一致的新VMA
         if (nvma == NULL)
         {
-            return -E_NO_MEM;
+            return -E_NO_MEM; // 创建VMA失败（内存不足），返回内存不足错误
         }
 
-        insert_vma_struct(to, nvma);
+        insert_vma_struct(to, nvma); // 将新创建的VMA插入子进程的mm_struct,方便后续COW处理
 
-        bool share = 0;
+        bool share = 1; // 设置COW核心参数——share=1,表示在fork时采用共享（COW）模式
+
+        // 复制页表项并配置COW属性（当 share=1 时，copy_range 会建立父子共享、并清除写权限）
         if (copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, share) != 0)
         {
             return -E_NO_MEM;
         }
     }
     return 0;
+}
+
+// do_pgfault - handle page fault within a mm (used to implement COW)
+// @mm: mm_struct of faulting process
+// @error_code: reserved (not used for RISC-V here)
+// @addr: faulting linear address
+int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+{
+    if (mm == NULL)
+    {
+        return -E_INVAL;
+    }
+
+    // 对齐到页边界，后续页表操作都基于页对齐地址
+    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
+
+    // check vma permissions first
+    struct vma_struct *vma = find_vma(mm, la);
+    if (vma == NULL || !(vma->vm_flags & VM_WRITE))
+    {
+        // illegal access
+        return -E_INVAL;
+    }
+
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+    if (ptep == NULL || !(*ptep & PTE_V))
+    {
+        return -E_INVAL; // 无映射
+    }
+
+    uint32_t perm = (*ptep & PTE_USER);
+
+    // 如果该页已经可写，则无需处理
+    if ((*ptep & PTE_W) != 0)
+    {
+        return 0;
+    }
+
+    // 若非用户页则视为非法访问（这里仅对用户页进行 COW 处理）
+    if (!(*ptep & PTE_U))
+    {
+        return -E_INVAL;
+    }
+
+    struct Page *old = pte2page(*ptep);
+    if (old == NULL)
+    {
+        return -E_INVAL;
+    }
+
+    if (page_ref(old) > 1)
+    {
+        // 需要复制
+        struct Page *newp = alloc_page();
+        if (newp == NULL)
+        {
+            return -E_NO_MEM;
+        }
+        memcpy(page2kva(newp), page2kva(old), PGSIZE);
+        // insert new page with writable permission
+        if (page_insert(mm->pgdir, newp, la, perm | PTE_W) != 0)
+        {
+            free_page(newp);
+            return -E_NO_MEM;
+        }
+        cprintf("COW_COPY: copied page for addr %p\n", (void *)la);
+        return 0;
+    }
+    else
+    {
+        // 唯一引用：直接将该页设置为可写（无需复制）
+        *ptep = pte_create(page2ppn(old), PTE_V | (perm | PTE_W));
+        tlb_invalidate(mm->pgdir, la);
+        cprintf("COW_PROMOTE: made page writable for addr %p\n", (void *)la);
+        return 0;
+    }
 }
 
 void exit_mmap(struct mm_struct *mm)

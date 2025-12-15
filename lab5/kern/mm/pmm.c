@@ -373,16 +373,24 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
  *
  * CALL GRAPH: copy_mm-->dup_mmap-->copy_range
  */
+/*
+LAB5:EXERCISE2 YOUR CODE
+*/
+// 学号：2312189 姓名：查科言
+// 实现 fork 时父子进程用户内存复制 的最终落地函数，核心作用是以物理页为单位，
+// 将父进程（进程 A）用户地址空间 [start, end) 范围内的内存数据，完整复制到子进程（进程 B）的地址空间中。
+// do_fork（创建子进程）→ copy_mm（复制内存管理结构）→ dup_mmap（复制虚拟内存区域 VMA）→ copy_range（复制实际物理页数据)
 int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
                bool share)
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
-    assert(USER_ACCESS(start, end));
+    assert(USER_ACCESS(start, end)); // 判断地址是否在用户态可访问范围
     // copy content by page unit.
-    do
+    do // 按页遍历复制
     {
-        // call get_pte to find process A's pte according to the addr start
+        // 根据父进程页目录表（from）和虚拟地址（start），查找对应的页表项（PTE） 的内核虚拟地址
         pte_t *ptep = get_pte(from, start, 0), *nptep;
+        // 父进程该虚拟地址范围的二级页表未分配（无有效数据），无需复制，跳过该页表范围(+PTSIZE)
         if (ptep == NULL)
         {
             start = ROUNDDOWN(start + PTSIZE, PTSIZE);
@@ -390,31 +398,52 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
         }
         // call get_pte to find process B's pte according to the addr start. If
         // pte is NULL, just alloc a PT
-        if (*ptep & PTE_V)
+        if (*ptep & PTE_V) // PTE_V：页表项的「有效位」，值为 1 表示该虚拟地址对应物理页已分配（父进程该页有有效数据）；值为 0 则无数据，无需复制
         {
-            if ((nptep = get_pte(to, start, 1)) == NULL)
-            {
-                return -E_NO_MEM;
-            }
-            uint32_t perm = (*ptep & PTE_USER);
+            uint32_t perm = (*ptep & PTE_USER); // 提取父进程该页的用户权限
             // get page from ptep
             struct Page *page = pte2page(*ptep);
-            // alloc a page for process B
-            struct Page *npage = alloc_page();
-            assert(page != NULL);
-            assert(npage != NULL);
-            int ret = 0;
-            void *src_kvaddr = page2kva(page);
-            void *dst_kvaddr = page2kva(npage);
-            memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
-            ret = page_insert(to, npage, start, perm);
-            if (ret != 0)
+            if (share)
             {
-                free_page(npage);
-                return ret;
+                // 共享 COW 模式：父进程与子进程指向相同的物理页
+                // 清除写权限（使其只读），并通过将该页插入子进程页表来增加引用计数
+                uint32_t perm_no_write = perm & (~PTE_W);
+                // 更新父进程的 PTE，移除写权限
+                *ptep = pte_create(page2ppn(page), PTE_V | perm_no_write);
+                tlb_invalidate(from, start);
+                // 将同一物理页插入子进程页表（page_insert 会对 page->ref 自增）
+                if ((nptep = get_pte(to, start, 1)) == NULL)
+                {
+                    return -E_NO_MEM;
+                }
+                if (page_insert(to, page, start, perm_no_write) != 0)
+                {
+                    return -E_NO_MEM;
+                }
+                cprintf("EAGER_TO_SHARED: shared page at va %p\n", (void *)start);
+            }
+            else
+            {
+                if ((nptep = get_pte(to, start, 1)) == NULL)
+                {
+                    return -E_NO_MEM; // 子进程页表项创建失败，返回内存不足错误
+                }
+                // old behavior: allocate new page and copy
+                struct Page *npage = alloc_page();
+                assert(page != NULL);
+                assert(npage != NULL);
+                void *src_kvaddr = page2kva(page);
+                void *dst_kvaddr = page2kva(npage);
+                memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+                if (page_insert(to, npage, start, perm) != 0)
+                {
+                    free_page(npage);
+                    return -E_NO_MEM;
+                }
+                cprintf("EAGER_COPY: copied page at va %p\n", (void *)start);
             }
         }
-        start += PGSIZE;
+        start += PGSIZE; // 继续处理下一个页
     } while (start != 0 && start < end);
     return 0;
 }

@@ -158,6 +158,7 @@ void interrupt_handler(struct trapframe *tf)
     }
 }
 void kernel_execve_ret(struct trapframe *tf, uintptr_t kstacktop);
+
 void exception_handler(struct trapframe *tf)
 {
     int ret;
@@ -216,7 +217,24 @@ void exception_handler(struct trapframe *tf)
         cprintf("Load page fault\n");
         break;
     case CAUSE_STORE_PAGE_FAULT:
-        cprintf("Store/AMO page fault\n");
+        {
+            cprintf("Store/AMO page fault\n");
+            // Attempt to handle COW: call do_pgfault for current process
+            if (current != NULL && current->mm != NULL && !trap_in_kernel(tf))
+            {
+                extern int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr);
+                int r = do_pgfault(current->mm, 0, tf->tval);
+                if (r == 0)
+                {
+                    // 已处理：返回用户态
+                    return;
+                }
+                else
+                {
+                    cprintf("do_pgfault failed: %d\n", r);
+                }
+            }
+        }
         break;
     default:
         print_trapframe(tf);

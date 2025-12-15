@@ -371,8 +371,17 @@ run_test -prog 'softint' -check default_check                   \
         'Breakpoint'                                            \
         'all user-mode processes have quit.'                    \
         'init check memory pass.'                               
+# 10改为15了
+pts=15
 
-pts=10
+# --- 新+ cowtest 样例 ---
+run_test -prog 'cowtest' -check default_check                   \
+        'kernel_execve: pid = 2, name = "cowtest".'             \
+        'child before write: hello world'                       \
+        'child after write: Hello World'                        \
+        'parent after child write: hello world'                 \
+    ! - 'user panic at .*'
+
 
 run_test -prog 'faultread'  -check default_check                                     \
         'kernel_execve: pid = 2, name = "faultread".'           \
