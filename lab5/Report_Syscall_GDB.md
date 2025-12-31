@@ -251,6 +251,152 @@ sstatus 0x8000000000046020
 - 在宿主侧断到 QEMU 的 RISC-V 翻译/异常处理代码（`target/riscv/translate.c` 与 helper 逻辑）
 - 解释 QEMU 的 TCG translation 如何把 `ecall/sret` 翻译成 helper 调用并正确模拟特权切换
 
+### 10.1 双重 GDB：宿主(QEMU) + 客体(uCore) 同步断点序列（可逐条执行）
+
+> 目标：让“宿主侧（QEMU 源码级）”与“客体侧（uCore 内核/用户态）”停在同一条事件链上：
+>
+> - `ecall` 触发点：宿主侧停在 QEMU 的 `helper_raise_exception(..., exception=0x8)`；客体侧紧接着停在 `exception_handler(tf)` 且 `tf->cause==0x8`。
+> - `sret` 返回点：宿主侧停在 QEMU 的 `helper_sret()`；客体侧停在 `__trapret` 中的 `sret` 指令并单步返回用户态。
+
+#### A. 预备：选一个稳定触发 syscall 的测试
+
+建议用 `exit`（触发一次系统调用后很快结束，事件链短、好同步）。
+
+在 lab5 目录：
+
+```bash
+make build-exit
+```
+
+> 说明：`build-exit` 会把内核编译成默认运行 `exit` 用户程序（通过 `DEFS+=-DTEST=exit ...` 注入）。
+
+#### B. 终端 1：启动“宿主侧 gdb”并在 QEMU 里下断点
+
+在 lab5 目录新开一个终端（终端 1），用宿主 gdb 启动 QEMU（注意使用你编译出来的带符号 QEMU）：
+
+```bash
+cd lab5
+gdb --args ~/src/qemu-4.1.1-debug/build/riscv64-softmmu/qemu-system-riscv64 \
+   -machine virt -nographic -bios default \
+   -device loader,file=bin/kernel,addr=0x80200000 \
+   -s -S
+```
+
+在宿主 gdb 里逐条执行：
+
+```gdb
+set pagination off
+set confirm off
+set disassemble-next-line on
+
+# 1) ecall 执行时，QEMU 会通过 helper_raise_exception 抛出异常（U_ECALL=0x8）
+b helper_raise_exception if exception == 0x8
+
+# 2) 异常真正“注入”到 CPU（写 CSR/跳转到 stvec 等）通常会经过 riscv_cpu_do_interrupt
+b riscv_cpu_do_interrupt
+
+# 3) sret 执行时会走 helper_sret（它会返回 retpc = env->sepc）
+b helper_sret
+
+# （可选）如果你也想看到翻译阶段（TCG translate）什么时候识别到 ecall/sret：
+b trans_ecall
+b trans_sret
+
+run
+```
+
+当宿主侧命中断点后，常用检查命令（每次命中都可以做一遍）：
+
+```gdb
+bt
+info args
+
+# 对于 helper_raise_exception：
+p/x exception
+p/x env->pc
+
+# 对于 helper_sret：
+p/x env->sepc
+finish   # 看 helper_sret 的返回值 retpc（返回后 gdb 会打印）
+```
+
+#### C. 终端 2：连接“客体侧 gdb”（调 uCore）并设置内核断点
+
+再开一个终端（终端 2），连接 QEMU 的 gdbstub（1234）：
+
+```bash
+cd lab5
+riscv64-unknown-elf-gdb
+```
+
+在客体 gdb 里逐条执行：
+
+```gdb
+set pagination off
+file bin/kernel
+set arch riscv:rv64
+target remote :1234
+
+# 1) 精准捕获 U-mode ecall 进入内核
+b exception_handler if ((struct trapframe*)$a0)->cause == 0x8
+
+# 2) 捕获返回路径（__trapret 最后会执行 sret）
+b __trapret
+
+c
+```
+
+当命中 `exception_handler` 后，在客体 gdb 里执行：
+
+```gdb
+set $tf = (struct trapframe*)$a0
+p/x $tf->cause
+p/x $tf->epc
+x/6i  $tf->epc
+
+# 验证内核会做 epc += 4（返回点应是 ecall 下一条）
+p/x ($tf->epc + 4)
+```
+
+当命中 `__trapret` 后，按下面步骤精确停到 `sret` 并单步返回：
+
+```gdb
+disassemble /r __trapret
+
+# 在反汇编里找到那条 sret 的实际地址，把它替换到下一行：
+b *<SRET_ADDR>
+
+c
+
+# 现在停在 sret 上
+info reg sepc sstatus
+x/4i $pc
+
+# 单步执行 sret（返回用户态）
+si
+info reg pc
+```
+
+#### D. 两边“同步”的关键手法（防止卡死/错过时机）
+
+1) **宿主 gdb 一旦断住，客体 gdb 会“假死”是正常的**：因为 QEMU 进程被宿主 gdb 暂停了，gdbstub 也就无法响应客体 gdb。
+
+2) 推荐的同步节奏（按事件链）：
+
+- 运行到第一次系统调用时：
+   - 通常**先命中宿主断点**：`helper_raise_exception (exception=0x8)`
+   - 你在宿主 gdb 看完 `info args / p/x env->pc` 后执行 `continue`
+   - 立刻切到客体 gdb，你会看到**紧接着命中**：`exception_handler(tf)` 且 `tf->cause==0x8`
+
+- 返回用户态时：
+   - 客体 gdb 先停在 `sret` 指令（`b *<SRET_ADDR>` 命中）
+   - 你在客体 gdb 输入 `si` 后如果“没反应”，立刻切到宿主 gdb：
+      - 多半此时宿主断在 `helper_sret`
+      - 宿主侧 `finish` 看返回值（应等于 `env->sepc`）后 `continue`
+   - 回到客体 gdb：`si` 会完成，你会看到 `pc` 跳回用户态地址（例如 `0x800108`）
+
+> 小提示：如果你发现 `helper_raise_exception` 命中太频繁（别的异常也进来），可以把条件从 `exception==0x8` 改成你观察到的具体 ecall 类型；对本实验的 U-mode ecall 来说，`0x8` 就是目标值。
+
 ---
 
 ## 附录 A：本次关键 GDB 命令清单
