@@ -1,0 +1,4 @@
+obj/kern/schedule/sched_fifo.o obj/kern/schedule/sched_fifo.d: \
+ kern/schedule/sched_fifo.c libs/defs.h libs/list.h kern/process/proc.h \
+ kern/trap/trap.h kern/mm/memlayout.h libs/atomic.h libs/skew_heap.h \
+ kern/debug/assert.h kern/schedule/sched.h
