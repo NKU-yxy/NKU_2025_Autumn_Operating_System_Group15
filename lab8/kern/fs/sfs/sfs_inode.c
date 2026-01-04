@@ -553,6 +553,7 @@ static int
 sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset, size_t *alenp, bool write) {
     struct sfs_disk_inode *din = sin->din;
     assert(din->type != SFS_TYPE_DIR);
+    off_t startpos = offset;
     off_t endpos = offset + *alenp, blkoff;
     *alenp = 0;
 	// calculate the Rd/Wr end position
@@ -652,9 +653,12 @@ sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset
 
 out:
     *alenp = alen;
-    if (offset + alen > sin->din->size) {
-        sin->din->size = offset + alen;
-        sin->dirty = 1;
+    if (write && alen != 0) {
+        off_t finalpos = startpos + alen;
+        if (finalpos > sin->din->size) {
+            sin->din->size = finalpos;
+            sin->dirty = 1;
+        }
     }
     return ret;
 }

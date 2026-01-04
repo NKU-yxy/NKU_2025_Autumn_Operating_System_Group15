@@ -823,7 +823,6 @@ load_icode(int fd, int argc, char **kargv)
         {
             continue;
         }
-        cprintf("debug ph %d: off=%lx va=%lx filesz=%lx memsz=%lx flags=%x\n", i, ph.p_offset, ph.p_va, ph.p_filesz, ph.p_memsz, ph.p_flags);
         if (ph.p_filesz > ph.p_memsz)
         {
             ret = -E_INVAL;
@@ -885,28 +884,6 @@ load_icode(int fd, int argc, char **kargv)
                     goto bad_cleanup_mmap;
                 }
             }
-        }
-    }
-
-    /* Debug: verify text bytes loaded correctly around sh .text. */
-    {
-        uintptr_t samples[] = {0x800020, 0x800320};
-        for (size_t s = 0; s < sizeof(samples) / sizeof(samples[0]); s++)
-        {
-            uintptr_t sample = samples[s];
-            uint32_t words[4] = {0};
-            for (int i = 0; i < 4; i++)
-            {
-                uintptr_t la = sample + i * sizeof(uint32_t);
-                struct Page *pg = get_page(mm->pgdir, la, NULL);
-                if (pg == NULL)
-                {
-                    cprintf("debug load_icode: page missing at %x\n", la);
-                    break;
-                }
-                memcpy(&words[i], page2kva(pg) + PGOFF(la), sizeof(uint32_t));
-            }
-            cprintf("debug load_icode text@%08x: %08x %08x %08x %08x\n", sample, words[0], words[1], words[2], words[3]);
         }
     }
 
